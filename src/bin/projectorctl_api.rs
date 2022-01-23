@@ -1,72 +1,101 @@
 #![feature(proc_macro_hygiene, decl_macro)]
 
-#[macro_use] extern crate rocket;
+#[macro_use]
+extern crate rocket;
+extern crate okapi;
 
 use projectorctl::*;
 
-use std::io::Cursor;
-use std::path::Path;
-use rocket::{Config, Request};
-use std::net::IpAddr;
-use std::str::FromStr;
+use log::{info, warn};
+use rocket::config::LogLevel;
 use rocket::http::Status;
-use rocket::response::{self, Response, Responder};
+use rocket::{get, put, serde::json::Json};
+use rocket::{Config, State};
+use rocket_okapi::{openapi, openapi_get_routes};
+use std::net::IpAddr;
+use std::path::Path;
+use std::str::FromStr;
+use std::sync::{Arc, Mutex, MutexGuard};
 
-pub struct WebReply(Reply);
+type ControllerPointer = Arc<Mutex<Controller>>;
 
-impl<'r, 'o: 'r> Responder<'r, 'o>  for WebReply {
-    fn respond_to(self, _: &'r Request<'_>) -> response::Result<'o> {
-        let body = match self.0 {
-            Reply::State(b) => format!("{}", b),
-            Reply::ValueU8(v) => format!("{}", v),
-            Reply::ValueU32(v) => format!("{}", v),
-        };
-        Response::build()
-            .sized_body(body.len(), Cursor::new(body))
-            .status(Status::Ok)
-            .ok()
+fn get_controller(
+    pointer: &State<Arc<Mutex<Controller>>>,
+) -> Result<MutexGuard<Controller>, ControllerErr> {
+    match pointer.inner().lock() {
+        Ok(r) => Ok(r),
+        Err(_) => Err(ControllerErr::SerialPortError),
     }
 }
 
-pub struct WebErr(ControllerErr);
-
-impl<'r, 'o: 'r> Responder<'r, 'o> for WebErr {
-    fn respond_to(self, _: &'r Request<'_>) -> response::Result<'o> {
-        let status = match self.0 {
-            ControllerErr::SerialPortError => Status::InternalServerError,
-            ControllerErr::UnsupportedCommand => Status::NotImplemented,
-        };
-        let body = format!("{:?}", self.0);
-        Response::build()
-            .sized_body(body.len(), Cursor::new(body))
-            .status(status)
-            .ok()
-    }
-}
-
-impl From<ControllerErr> for WebErr {
-    fn from(e: ControllerErr) -> Self {
-        WebErr(e)
-    }
-}
-
+#[openapi]
 #[get("/<command>")]
-pub fn read(command: &str) -> Result<WebReply, WebErr> {
-    let mut controller = Controller::new(Path::new("/dev/ttyUSB0"))?;
-    let comm = get_command(command, SubCommand::Status)?;
-    Ok(WebReply(controller.read(&comm)?))
+pub fn read(
+    pointer: &State<ControllerPointer>,
+    command: &str,
+) -> Result<Json<Reply>, (Status, Json<ControllerErr>)> {
+    let controller = get_controller(pointer);
+    let comm = get_command(command, &SubCommand::Status);
+    if let Err(e) = comm {
+        warn!("Cannot parse command {:?}", e);
+        return Err((Status::NotFound, Json(e)));
+    }
+    let comm = comm.unwrap();
+    match controller {
+        Ok(mut c) => match c.read(&comm) {
+            Ok(reply) => {
+                info!("Get state of {:?}: {:?}", comm, reply);
+                Ok(Json(reply))
+            }
+            Err(e) => {
+                warn!("Cannot read from tty {:?}", e);
+                Err((Status::InternalServerError, Json(e)))
+            }
+        },
+        Err(e) => {
+            warn!("Cannot get controller {:?}", e);
+            Err((Status::InternalServerError, Json(e)))
+        }
+    }
 }
 
-#[put("/<command>?<state>")]
-pub fn write(command: &str, state: &str) -> Result<(), WebErr>  {
-    let mut controller = Controller::new(Path::new("/dev/ttyUSB0"))?;
-    let sc = get_subcommand(state)?;
-    if let SubCommand::Status = sc {
-        return Err(WebErr(ControllerErr::UnsupportedCommand));
+#[openapi]
+#[put("/<command>", data = "<subcommand>")]
+pub fn write(
+    pointer: &State<ControllerPointer>,
+    command: &str,
+    subcommand: Json<SubCommand>,
+) -> Result<(), (Status, Json<ControllerErr>)> {
+    let controller = get_controller(pointer);
+    if let SubCommand::Status = subcommand.0 {
+        return Err((
+            Status::NotAcceptable,
+            Json(ControllerErr::UnsupportedCommand),
+        ));
     }
-    let write = get_command(command, sc)?;
-    controller.write(&write)?;
-    Ok(())
+    let comm = get_command(command, &subcommand.0);
+    if let Err(e) = comm {
+        warn!("Cannot parse command {:?}", e);
+        return Err((Status::NotFound, Json(e)));
+    }
+    let comm = comm.unwrap();
+
+    match controller {
+        Ok(mut c) => match c.write(&comm) {
+            Ok(_) => {
+                info!("Set {:?}", comm);
+                return Ok(());
+            }
+            Err(e) => {
+                warn!("Cannot write to tty {:?}", e);
+                return Err((Status::InternalServerError, Json(e)));
+            }
+        },
+        Err(e) => {
+            warn!("Cannot get controller {:?}", e);
+            return Err((Status::InternalServerError, Json(e)));
+        }
+    }
 }
 
 #[launch]
@@ -74,28 +103,25 @@ fn rocket() -> _ {
     let mut config = Config::release_default();
     config.address = IpAddr::from_str("0.0.0.0").unwrap();
     config.port = 43880;
+    config.log_level = LogLevel::Normal;
 
-    rocket::custom(config).mount("/", routes![read, write])
+    let controller = Controller::new(Path::new("/dev/ttyUSB0"));
+    let pointer = Arc::new(Mutex::new(controller.expect("Controller was not created")));
+
+    rocket::custom(config)
+        .manage(pointer)
+        .mount("/", openapi_get_routes![read, write])
 }
 
-fn get_subcommand(state: &str) -> Result<SubCommand, WebErr> {
-    match state {
-        "up" => Ok(SubCommand::Up),
-        "down" => Ok(SubCommand::Down),
-        "status" => Ok(SubCommand::Status),
-        _ => Err(WebErr(ControllerErr::UnsupportedCommand)),
-    }
-}
-
-fn get_command(command: &str, state: SubCommand) -> Result<Command, WebErr> {
+fn get_command(command: &str, state: &SubCommand) -> Result<Command, ControllerErr> {
     match command {
-        "power" => Ok(Command::Power(state)),
-        "eco" => Ok(Command::Eco(state)),
-        "source" => Ok(Command::Source(state)),
-        "brightness" => Ok(Command::Brightness(state)),
-        "volume" => Ok(Command::Volume(state)),
-        "mute" => Ok(Command::Mute(state)),
-        "lamp_time" => Ok(Command::Mute(state)),
-        _ => Err(WebErr(ControllerErr::UnsupportedCommand)),
+        "power" => Ok(Command::Power(state.clone())),
+        "eco" => Ok(Command::Eco(state.clone())),
+        "source" => Ok(Command::Source(state.clone())),
+        "brightness" => Ok(Command::Brightness(state.clone())),
+        "volume" => Ok(Command::Volume(state.clone())),
+        "mute" => Ok(Command::Mute(state.clone())),
+        "lamp_time" => Ok(Command::Mute(state.clone())),
+        _ => Err(ControllerErr::UnsupportedCommand),
     }
 }
